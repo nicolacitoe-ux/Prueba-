@@ -14,8 +14,16 @@ pip install -r requirements.txt
 
 ### Uso
 
+Imprimir el resultado en pantalla:
+
 ```bash
 python example_usage.py ruta/al/archivo.pdf
+```
+
+Convertir y guardar el resultado como `.md` en `converted/`:
+
+```bash
+python convert.py ruta/al/archivo.pdf
 ```
 
 O directamente en Python:
