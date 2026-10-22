@@ -7,6 +7,9 @@ Consulta únicamente servicios legales y documentados:
 - Europe PMC (https://europepmc.org): literatura biomédica y texto completo de PMC.
 - arXiv (https://arxiv.org): preprints de física, matemáticas, informática, etc.
 - Crossref / doi.org: metadatos y citas formateadas (APA) por negociación de contenido.
+- PubMed (NCBI E-utilities): literatura biomédica y biotecnológica indexada en MEDLINE.
+- UniProt (https://www.uniprot.org): secuencias, función y números EC de proteínas.
+- KEGG (https://www.kegg.jp): enzimas, rutas metabólicas, compuestos y reacciones.
 
 La lógica está separada del servidor MCP para poder probarla de forma aislada.
 """
@@ -14,8 +17,10 @@ La lógica está separada del servidor MCP para poder probarla de forma aislada.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
+import unicodedata
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
@@ -29,6 +34,16 @@ EUROPEPMC_URL = "https://www.ebi.ac.uk/europepmc/webservices/rest"
 ARXIV_URL = "https://export.arxiv.org/api/query"
 CROSSREF_URL = "https://api.crossref.org/works"
 DOI_URL = "https://doi.org"
+EUTILS_URL = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
+UNIPROT_URL = "https://rest.uniprot.org/uniprotkb/search"
+KEGG_URL = "https://rest.kegg.jp"
+
+# Campos de las fichas KEGG que se devuelven; el resto (GENES, REFERENCE...) es muy extenso.
+KEGG_CAMPOS = {
+    "ENTRY", "NAME", "DEFINITION", "DESCRIPTION", "CLASS", "SYSNAME", "REACTION",
+    "ALL_REAC", "SUBSTRATE", "PRODUCT", "COMMENT", "PATHWAY", "MODULE", "ORTHOLOGY",
+    "ENZYME", "FORMULA", "EXACT_MASS", "MOL_WEIGHT", "EQUATION", "RCLASS", "DBLINKS",
+}
 
 ATOM_NS = {
     "atom": "http://www.w3.org/2005/Atom",
@@ -54,6 +69,20 @@ def normalizar_doi(doi: str) -> str:
 def nombre_archivo_seguro(doi: str) -> str:
     """Convierte un DOI en un nombre de archivo sin separadores de ruta."""
     return re.sub(r"[^A-Za-z0-9._-]+", "_", doi).strip("._") + ".pdf"
+
+
+def nombre_proyecto_seguro(proyecto: str) -> str:
+    """Valida el nombre de un proyecto para usarlo como carpeta (sin rutas ni '..')."""
+    limpio = " ".join(re.sub(r"[^\w\s-]", "", proyecto, flags=re.UNICODE).split())
+    if not limpio:
+        raise OAError(f"Nombre de proyecto no válido: {proyecto!r}")
+    return limpio
+
+
+def _clave_orden_apa(referencia: str) -> str:
+    """Clave de ordenación alfabética de referencias APA (sin tildes ni marcas)."""
+    sin_tildes = unicodedata.normalize("NFKD", referencia).encode("ascii", "ignore").decode()
+    return re.sub(r"[^a-z0-9 ]", "", sin_tildes.lower())
 
 
 def reconstruir_resumen(indice_invertido: dict[str, list[int]] | None) -> str | None:
@@ -147,6 +176,75 @@ def _parsear_arxiv(xml_text: str) -> list[dict[str, Any]]:
     return resultados
 
 
+def _resumir_pubmed(doc: dict[str, Any]) -> dict[str, Any]:
+    ids = {a.get("idtype"): a.get("value") for a in doc.get("articleids", [])}
+    pmcid = ids.get("pmc")
+    return {
+        "titulo": doc.get("title"),
+        "autores": [a["name"] for a in doc.get("authors", []) if a.get("name")],
+        "revista": doc.get("fulljournalname") or doc.get("source"),
+        "fecha": doc.get("pubdate"),
+        "tipo": doc.get("pubtype", []),
+        "pmid": doc.get("uid"),
+        "doi": ids.get("doi"),
+        "pmcid": pmcid,
+        "url": f"https://pubmed.ncbi.nlm.nih.gov/{doc.get('uid')}/",
+    }
+
+
+def _resumir_uniprot(e: dict[str, Any]) -> dict[str, Any]:
+    desc = e.get("proteinDescription") or {}
+    nombre = ((desc.get("recommendedName") or {}).get("fullName") or {}).get("value")
+    if not nombre:
+        alternativos = desc.get("submissionNames") or [{}]
+        nombre = (alternativos[0].get("fullName") or {}).get("value")
+    ec = [x.get("value") for x in (desc.get("recommendedName") or {}).get("ecNumbers", [])]
+    funcion = [
+        t.get("value")
+        for c in e.get("comments", [])
+        if c.get("commentType") == "FUNCTION"
+        for t in c.get("texts", [])
+    ]
+    acceso = e.get("primaryAccession")
+    return {
+        "accesion": acceso,
+        "proteina": nombre,
+        "genes": [
+            g["geneName"]["value"] for g in e.get("genes", []) if g.get("geneName")
+        ],
+        "organismo": (e.get("organism") or {}).get("scientificName"),
+        "numeros_ec": ec,
+        "longitud": (e.get("sequence") or {}).get("length"),
+        "revisada": "reviewed" in (e.get("entryType") or "").lower()
+        and "unreviewed" not in (e.get("entryType") or "").lower(),
+        "funcion": " ".join(funcion) or None,
+        "url": f"https://www.uniprot.org/uniprotkb/{acceso}/entry" if acceso else None,
+    }
+
+
+def _parsear_ficha_kegg(texto: str, max_lineas_campo: int = 25) -> dict[str, Any]:
+    """Convierte una ficha KEGG (formato plano de columnas fijas) en un diccionario."""
+    campos: dict[str, list[str]] = {}
+    actual = None
+    for linea in texto.splitlines():
+        if linea.startswith("///"):
+            break
+        clave = linea[:12].strip()
+        if clave and not linea.startswith(" "):
+            actual = clave
+            campos.setdefault(actual, [])
+        if actual in KEGG_CAMPOS and linea[12:].strip():
+            campos[actual].append(linea[12:].strip())
+    resultado: dict[str, Any] = {}
+    for clave, lineas in campos.items():
+        if clave not in KEGG_CAMPOS:
+            continue
+        resultado[clave.lower()] = lineas[:max_lineas_campo]
+        if len(lineas) > max_lineas_campo:
+            resultado[clave.lower()].append(f"... ({len(lineas) - max_lineas_campo} líneas más)")
+    return resultado
+
+
 def _texto_xml_jats(xml_text: str, max_caracteres: int) -> dict[str, Any]:
     """Extrae título, resumen y secciones del cuerpo de un XML JATS de PMC."""
     raiz = ET.fromstring(xml_text)
@@ -228,6 +326,7 @@ class OAClient:
             or os.environ.get("OA_DOWNLOAD_DIR")
             or Path.home() / "articulos_oa"
         ).expanduser()
+        self.ncbi_api_key = os.environ.get("NCBI_API_KEY")
         agente = "oa-research-mcp/1.0"
         if self.email:
             agente += f" (mailto:{self.email})"
@@ -301,6 +400,155 @@ class OAClient:
         )
         resp.raise_for_status()
         return _parsear_arxiv(resp.text)
+
+    async def buscar_pubmed(
+        self,
+        consulta: str,
+        max_resultados: int = 10,
+        desde_anio: int | None = None,
+        hasta_anio: int | None = None,
+        orden: str = "relevancia",
+    ) -> list[dict[str, Any]]:
+        base = {"db": "pubmed", "retmode": "json", "tool": "oa-research-mcp"}
+        if self.email:
+            base["email"] = self.email
+        if self.ncbi_api_key:
+            base["api_key"] = self.ncbi_api_key
+        params = {**base, "term": consulta, "retmax": min(max_resultados, 100),
+                  "sort": "pub_date" if orden == "fecha" else "relevance"}
+        if desde_anio or hasta_anio:
+            params.update(datetype="pdat", mindate=str(desde_anio or 1800),
+                          maxdate=str(hasta_anio or 3000))
+        busqueda = await self._get_json(f"{EUTILS_URL}/esearch.fcgi", params)
+        ids = busqueda.get("esearchresult", {}).get("idlist", [])
+        if not ids:
+            return []
+        resumen = await self._get_json(f"{EUTILS_URL}/esummary.fcgi", {**base, "id": ",".join(ids)})
+        docs = resumen.get("result", {})
+        return [_resumir_pubmed(docs[i]) for i in ids if i in docs]
+
+    async def buscar_uniprot(
+        self,
+        consulta: str,
+        organismo: str | None = None,
+        solo_revisadas: bool = True,
+        max_resultados: int = 10,
+    ) -> list[dict[str, Any]]:
+        partes = [f"({consulta})"]
+        if organismo:
+            partes.append(f'(organism_name:"{organismo}")')
+        if solo_revisadas:
+            partes.append("(reviewed:true)")
+        datos = await self._get_json(UNIPROT_URL, {
+            "query": " AND ".join(partes), "format": "json", "size": min(max_resultados, 50),
+            "fields": "accession,protein_name,gene_names,organism_name,ec,length,cc_function",
+        })
+        return [_resumir_uniprot(e) for e in datos.get("results", [])]
+
+    async def buscar_kegg(self, base: str, termino: str, max_resultados: int = 20) -> list[dict[str, str]]:
+        resp = await self._http.get(f"{KEGG_URL}/find/{base}/{quote(termino)}")
+        resp.raise_for_status()
+        resultados = []
+        for linea in resp.text.splitlines():
+            if "\t" in linea:
+                ident, descripcion = linea.split("\t", 1)
+                resultados.append({"id": ident, "descripcion": descripcion})
+        return resultados[:max_resultados]
+
+    async def detalle_kegg(self, identificador: str) -> dict[str, Any]:
+        identificador = identificador.strip()
+        if not re.fullmatch(r"[A-Za-z0-9_.:+-]+", identificador):
+            raise OAError(f"Identificador KEGG no válido: {identificador!r}")
+        resp = await self._http.get(f"{KEGG_URL}/get/{identificador}")
+        if resp.status_code == 404 or not resp.text.strip():
+            raise OAError(f"KEGG no tiene la entrada {identificador}.")
+        resp.raise_for_status()
+        return {"id": identificador, **_parsear_ficha_kegg(resp.text),
+                "url": f"https://www.kegg.jp/entry/{identificador}"}
+
+    # --- Proyectos ------------------------------------------------------------
+
+    def carpeta_proyecto(self, proyecto: str | None) -> Path:
+        if not proyecto:
+            return self.carpeta_descargas
+        return self.carpeta_descargas / nombre_proyecto_seguro(proyecto)
+
+    def listar_proyectos(self) -> list[str]:
+        configurados = [p.strip() for p in os.environ.get("OA_PROYECTOS", "").split(";") if p.strip()]
+        existentes = (
+            [d.name for d in self.carpeta_descargas.iterdir() if d.is_dir()]
+            if self.carpeta_descargas.is_dir() else []
+        )
+        nombres = {nombre_proyecto_seguro(p) for p in configurados} | set(existentes)
+        return sorted(nombres, key=_clave_orden_apa)
+
+    async def agregar_a_bibliografia(
+        self, dois: list[str], proyecto: str, idioma: str = "es-ES"
+    ) -> dict[str, Any]:
+        """Añade referencias APA a la bibliografía del proyecto, sin duplicar DOI."""
+        carpeta = self.carpeta_proyecto(proyecto)
+        carpeta.mkdir(parents=True, exist_ok=True)
+        ruta_json = carpeta / "bibliografia.json"
+        bibliografia: dict[str, str] = (
+            json.loads(ruta_json.read_text(encoding="utf-8")) if ruta_json.exists() else {}
+        )
+
+        pendientes = []
+        for doi in dois:
+            try:
+                normalizado = normalizar_doi(doi)
+            except OAError as exc:
+                pendientes.append(exc)
+                continue
+            if normalizado.lower() not in {d.lower() for d in bibliografia}:
+                pendientes.append(normalizado)
+
+        async def referencia(doi: str) -> dict[str, Any]:
+            try:
+                return await self.referencia_apa(doi, idioma)
+            except (OAError, httpx.HTTPError) as exc:
+                return {"doi": doi, "error": str(exc)}
+
+        resultados = await asyncio.gather(
+            *(referencia(d) for d in pendientes if isinstance(d, str))
+        )
+        agregadas = [r for r in resultados if "referencia" in r]
+        errores = [r for r in resultados if "error" in r]
+        errores += [{"error": str(e)} for e in pendientes if isinstance(e, OAError)]
+
+        for r in agregadas:
+            bibliografia[r["doi"]] = r["referencia"]
+        ruta_json.write_text(json.dumps(bibliografia, ensure_ascii=False, indent=2), encoding="utf-8")
+        ruta_md = carpeta / "referencias_apa.md"
+        ordenadas = sorted(bibliografia.values(), key=_clave_orden_apa)
+        ruta_md.write_text(
+            f"# Referencias — {carpeta.name}\n\n" + "\n\n".join(ordenadas) + "\n",
+            encoding="utf-8",
+        )
+        return {
+            "proyecto": carpeta.name,
+            "agregadas": [r["doi"] for r in agregadas],
+            "ya_existian": len(dois) - len(pendientes),
+            "errores": errores,
+            "total_referencias": len(bibliografia),
+            "archivo": str(ruta_md),
+        }
+
+    def ver_biblioteca(self, proyecto: str) -> dict[str, Any]:
+        carpeta = self.carpeta_proyecto(proyecto)
+        if not carpeta.is_dir():
+            return {"proyecto": nombre_proyecto_seguro(proyecto), "pdfs": [], "referencias": [],
+                    "aviso": "El proyecto aún no tiene archivos."}
+        ruta_json = carpeta / "bibliografia.json"
+        bibliografia = (
+            json.loads(ruta_json.read_text(encoding="utf-8")) if ruta_json.exists() else {}
+        )
+        return {
+            "proyecto": carpeta.name,
+            "carpeta": str(carpeta),
+            "pdfs": sorted(p.name for p in carpeta.glob("*.pdf")),
+            "referencias": sorted(bibliografia.values(), key=_clave_orden_apa),
+        }
 
     # --- Metadatos y localización de acceso abierto ---------------------------
 
@@ -390,13 +638,14 @@ class OAClient:
 
     # --- Descarga -------------------------------------------------------------
 
-    async def descargar_pdf(self, doi: str) -> dict[str, Any]:
+    async def descargar_pdf(self, doi: str, proyecto: str | None = None) -> dict[str, Any]:
+        carpeta = self.carpeta_proyecto(proyecto)
         info = await self.localizar_acceso_abierto(doi)
         if not info["candidatos"]:
             return {**info, "guardado_en": None}
 
-        self.carpeta_descargas.mkdir(parents=True, exist_ok=True)
-        destino = self.carpeta_descargas / nombre_archivo_seguro(info["doi"])
+        carpeta.mkdir(parents=True, exist_ok=True)
+        destino = carpeta / nombre_archivo_seguro(info["doi"])
         errores = []
         for cand in info["candidatos"]:
             url = cand["url_pdf"]
@@ -456,14 +705,16 @@ class OAClient:
     # --- Lotes ---------------------------------------------------------------
 
     async def procesar_lote(self, dois: list[str], descargar: bool = False,
+                            proyecto: str | None = None,
                             concurrencia: int = 4) -> list[dict[str, Any]]:
         semaforo = asyncio.Semaphore(concurrencia)
+        self.carpeta_proyecto(proyecto)  # valida el nombre antes de lanzar las consultas
 
         async def uno(doi: str) -> dict[str, Any]:
             async with semaforo:
                 try:
                     if descargar:
-                        return await self.descargar_pdf(doi)
+                        return await self.descargar_pdf(doi, proyecto)
                     info = await self.localizar_acceso_abierto(doi)
                     return {"doi": info["doi"], "titulo": info["titulo"],
                             "acceso_abierto": info["acceso_abierto"],

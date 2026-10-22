@@ -11,6 +11,7 @@ from oa_client import (
     OAError,
     formatear_apa,
     nombre_archivo_seguro,
+    nombre_proyecto_seguro,
     normalizar_doi,
     reconstruir_resumen,
 )
@@ -257,6 +258,121 @@ def test_servidor_registra_herramientas():
     assert nombres == {
         "buscar_articulos", "buscar_europe_pmc", "buscar_arxiv", "obtener_metadatos",
         "localizar_acceso_abierto", "descargar_pdf", "texto_completo_pmc",
-        "referencia_apa", "procesar_lista_dois",
+        "referencia_apa", "procesar_lista_dois", "buscar_pubmed", "buscar_proteinas_uniprot",
+        "buscar_kegg", "detalle_kegg", "listar_proyectos", "agregar_a_bibliografia",
+        "ver_biblioteca",
     }
     json.dumps([t.input_schema for t in ejecutar(mcp.list_tools())])
+
+
+KEGG_FICHA = """ENTRY       EC 3.1.1.3                  Enzyme
+NAME        triacylglycerol lipase;
+            lipase
+CLASS       Hydrolases;
+REACTION    triacylglycerol + H2O = diacylglycerol + a carboxylate [RN:R02250]
+PATHWAY     ec00561  Glycerolipid metabolism
+GENES       HSA: 5406(PNLIP)
+            MMU: 69060(Pnlip)
+///
+"""
+
+
+def test_nombre_proyecto_seguro():
+    assert nombre_proyecto_seguro("Proyecto de titulación NV") == "Proyecto de titulación NV"
+    assert nombre_proyecto_seguro("../../etc") == "etc"
+    with pytest.raises(OAError):
+        nombre_proyecto_seguro("../")
+
+
+def test_buscar_pubmed(tmp_path):
+    def handler(request):
+        params = request.url.params
+        if request.url.path.endswith("esearch.fcgi"):
+            assert params["term"] == "lipase AND bioreactor"
+            assert (params["mindate"], params["maxdate"]) == ("2019", "3000")
+            return httpx.Response(200, json={"esearchresult": {"idlist": ["111"]}})
+        assert params["id"] == "111"
+        return httpx.Response(200, json={"result": {"uids": ["111"], "111": {
+            "uid": "111", "title": "Lipasas en biorreactores", "authors": [{"name": "Pérez A"}],
+            "fulljournalname": "Biotechnol Adv", "pubdate": "2021 Mar",
+            "articleids": [{"idtype": "doi", "value": DOI}, {"idtype": "pmc", "value": "PMC9"}]}}})
+
+    c = crear_cliente(handler, tmp_path)
+    res = ejecutar(c.buscar_pubmed("lipase AND bioreactor", desde_anio=2019))
+    assert res[0]["doi"] == DOI and res[0]["pmcid"] == "PMC9"
+    assert res[0]["url"] == "https://pubmed.ncbi.nlm.nih.gov/111/"
+
+
+def test_buscar_uniprot(tmp_path):
+    def handler(request):
+        q = request.url.params["query"]
+        assert q == '(lipase) AND (organism_name:"Candida antarctica") AND (reviewed:true)'
+        return httpx.Response(200, json={"results": [{
+            "primaryAccession": "P41365", "entryType": "UniProtKB reviewed (Swiss-Prot)",
+            "proteinDescription": {"recommendedName": {
+                "fullName": {"value": "Lipase B"}, "ecNumbers": [{"value": "3.1.1.3"}]}},
+            "genes": [{"geneName": {"value": "LIPB"}}],
+            "organism": {"scientificName": "Moesziomyces antarcticus"},
+            "sequence": {"length": 342},
+            "comments": [{"commentType": "FUNCTION", "texts": [{"value": "Hidroliza lípidos."}]}],
+        }]})
+
+    c = crear_cliente(handler, tmp_path)
+    res = ejecutar(c.buscar_uniprot("lipase", organismo="Candida antarctica"))
+    assert res[0]["numeros_ec"] == ["3.1.1.3"]
+    assert res[0]["revisada"] is True and res[0]["funcion"] == "Hidroliza lípidos."
+
+
+def test_kegg_busqueda_y_ficha(tmp_path):
+    def handler(request):
+        if request.url.path.startswith("/find/"):
+            return httpx.Response(200, text="ec:3.1.1.3\ttriacylglycerol lipase; lipase\n")
+        assert request.url.path == "/get/ec:3.1.1.3"
+        return httpx.Response(200, text=KEGG_FICHA)
+
+    c = crear_cliente(handler, tmp_path)
+    assert ejecutar(c.buscar_kegg("enzyme", "lipase")) == [
+        {"id": "ec:3.1.1.3", "descripcion": "triacylglycerol lipase; lipase"}]
+    ficha = ejecutar(c.detalle_kegg("ec:3.1.1.3"))
+    assert ficha["name"] == ["triacylglycerol lipase;", "lipase"]
+    assert ficha["pathway"] == ["ec00561  Glycerolipid metabolism"]
+    assert "genes" not in ficha
+    with pytest.raises(OAError):
+        ejecutar(c.detalle_kegg("ec:1/../x"))
+
+
+def test_descarga_en_carpeta_de_proyecto(tmp_path):
+    def handler(request):
+        if request.url.host == "api.unpaywall.org":
+            return httpx.Response(200, json=UNPAYWALL)
+        if request.url.host == "www.ebi.ac.uk":
+            return httpx.Response(200, json={"resultList": {"result": []}})
+        return httpx.Response(200, content=PDF)
+
+    c = crear_cliente(handler, tmp_path)
+    res = ejecutar(c.descargar_pdf(DOI, proyecto="Biotecnología industrial NV"))
+    assert res["guardado_en"] == str(
+        tmp_path / "Biotecnología industrial NV" / nombre_archivo_seguro(DOI))
+
+
+def test_bibliografia_por_proyecto(tmp_path, monkeypatch):
+    refs = {"10.1000/b": "Zapata, L. (2020). B.", "10.1000/a": "Álvarez, M. (2019). A."}
+
+    def handler(request):
+        doi = request.url.path.lstrip("/")
+        return httpx.Response(200, text=refs[doi])
+
+    c = crear_cliente(handler, tmp_path)
+    proyecto = "Proyecto de titulación NV"
+    r1 = ejecutar(c.agregar_a_bibliografia(["10.1000/b", "no-doi"], proyecto))
+    assert r1["agregadas"] == ["10.1000/b"] and len(r1["errores"]) == 1
+    r2 = ejecutar(c.agregar_a_bibliografia(["10.1000/a", "https://doi.org/10.1000/b"], proyecto))
+    assert r2["agregadas"] == ["10.1000/a"] and r2["ya_existian"] == 1
+
+    md = (tmp_path / proyecto / "referencias_apa.md").read_text(encoding="utf-8")
+    assert md.index("Álvarez") < md.index("Zapata")
+    biblioteca = c.ver_biblioteca(proyecto)
+    assert biblioteca["referencias"] == ["Álvarez, M. (2019). A.", "Zapata, L. (2020). B."]
+
+    monkeypatch.setenv("OA_PROYECTOS", "Biotecnología industrial NV; Proyecto de titulación NV")
+    assert c.listar_proyectos() == ["Biotecnología industrial NV", "Proyecto de titulación NV"]

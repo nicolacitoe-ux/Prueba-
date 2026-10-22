@@ -2,7 +2,8 @@
 
 Expone a Claude herramientas para buscar artículos, localizar versiones legales
 de acceso abierto, descargar PDF, leer texto completo de PubMed Central y
-generar referencias APA 7.
+generar referencias APA 7. Incluye fuentes de biotecnología (PubMed, UniProt,
+KEGG) y organiza PDF y bibliografías por proyecto.
 
 Ejecución (transporte stdio, el que usa Claude Desktop):
     python open_access_server.py
@@ -10,6 +11,8 @@ Ejecución (transporte stdio, el que usa Claude Desktop):
 Variables de entorno:
     OA_EMAIL         Correo de contacto (obligatorio para Unpaywall; recomendado para OpenAlex).
     OA_DOWNLOAD_DIR  Carpeta donde se guardan los PDF (por defecto ~/articulos_oa).
+    OA_PROYECTOS     Nombres de proyectos separados por ';' (cada uno tiene su carpeta).
+    NCBI_API_KEY     Clave opcional de NCBI para aumentar el límite de consultas a PubMed.
 """
 
 from __future__ import annotations
@@ -24,15 +27,18 @@ from mcp.server.mcpserver.exceptions import ToolError
 from oa_client import OAClient, OAError
 
 INSTRUCCIONES = """\
-Herramientas de literatura científica que usan solo fuentes legales de acceso abierto
-(OpenAlex, Unpaywall, Europe PMC, arXiv y Crossref).
-Flujo recomendado: buscar_articulos -> localizar_acceso_abierto -> descargar_pdf o
-texto_completo_pmc -> referencia_apa. Para biomedicina, buscar_europe_pmc ofrece
-mejor cobertura de texto completo. Si un artículo no tiene versión abierta, indique
-las vías legales (biblioteca institucional, préstamo interbibliotecario, autor).
+Herramientas de investigación en biotecnología que usan solo fuentes legales de acceso
+abierto (OpenAlex, PubMed, Europe PMC, Unpaywall, arXiv, Crossref, UniProt y KEGG).
+Flujo recomendado: buscar_pubmed o buscar_articulos -> localizar_acceso_abierto ->
+descargar_pdf o texto_completo_pmc -> agregar_a_bibliografia. Para enzimas, proteínas y
+rutas metabólicas use buscar_proteinas_uniprot, buscar_kegg y detalle_kegg.
+Cuando el usuario trabaje en un proyecto (consulte listar_proyectos), pase su nombre en
+el parámetro 'proyecto' para guardar PDF y referencias en la carpeta correspondiente.
+Si un artículo no tiene versión abierta, indique las vías legales (biblioteca
+institucional, préstamo interbibliotecario, autor de correspondencia).
 """
 
-mcp = MCPServer("acceso-abierto", instructions=INSTRUCCIONES, version="1.0.0")
+mcp = MCPServer("acceso-abierto", instructions=INSTRUCCIONES, version="1.1.0")
 _cliente: OAClient | None = None
 
 
@@ -116,13 +122,14 @@ async def localizar_acceso_abierto(doi: str) -> dict[str, Any]:
 
 
 @herramienta
-async def descargar_pdf(doi: str) -> dict[str, Any]:
-    """Descarga el PDF de acceso abierto de un DOI en la carpeta OA_DOWNLOAD_DIR.
+async def descargar_pdf(doi: str, proyecto: str | None = None) -> dict[str, Any]:
+    """Descarga el PDF de acceso abierto de un DOI.
 
-    Solo descarga desde ubicaciones de acceso abierto registradas; si no existe
-    ninguna, devuelve alternativas legales para obtener el artículo.
+    Si se indica 'proyecto', se guarda en la subcarpeta de ese proyecto dentro de
+    OA_DOWNLOAD_DIR. Solo descarga desde ubicaciones de acceso abierto registradas;
+    si no existe ninguna, devuelve alternativas legales para obtener el artículo.
     """
-    return await cliente().descargar_pdf(doi)
+    return await cliente().descargar_pdf(doi, proyecto)
 
 
 @herramienta
@@ -142,13 +149,91 @@ async def referencia_apa(doi: str, idioma: Literal["es-ES", "en-US"] = "es-ES") 
 
 
 @herramienta
-async def procesar_lista_dois(dois: list[str], descargar: bool = False) -> list[dict[str, Any]]:
+async def procesar_lista_dois(
+    dois: list[str], descargar: bool = False, proyecto: str | None = None
+) -> list[dict[str, Any]]:
     """Comprueba (y opcionalmente descarga) el acceso abierto de una lista de DOI.
 
     Pensado para revisiones de literatura: admite hasta 100 DOI por llamada y
-    devuelve un informe por artículo.
+    devuelve un informe por artículo. Con 'proyecto', los PDF se guardan en su carpeta.
     """
-    return await cliente().procesar_lote(dois[:100], descargar)
+    return await cliente().procesar_lote(dois[:100], descargar, proyecto)
+
+
+@herramienta
+async def buscar_pubmed(
+    consulta: str,
+    max_resultados: int = 10,
+    desde_anio: int | None = None,
+    hasta_anio: int | None = None,
+    orden: Literal["relevancia", "fecha"] = "relevancia",
+) -> list[dict[str, Any]]:
+    """Busca en PubMed (MEDLINE) con la sintaxis de NCBI.
+
+    Admite términos MeSH y etiquetas de campo, p. ej.
+    '"Bioreactors"[MeSH] AND lipase[tiab] AND review[pt]'. Devuelve PMID, DOI y PMCID
+    (este último permite leer el texto completo con texto_completo_pmc).
+    """
+    return await cliente().buscar_pubmed(consulta, max_resultados, desde_anio, hasta_anio, orden)
+
+
+@herramienta
+async def buscar_proteinas_uniprot(
+    consulta: str,
+    organismo: str | None = None,
+    solo_revisadas: bool = True,
+    max_resultados: int = 10,
+) -> list[dict[str, Any]]:
+    """Busca proteínas y enzimas en UniProtKB.
+
+    Devuelve accesión, nombre, genes, organismo, números EC, longitud y función.
+    'solo_revisadas' limita a Swiss-Prot (anotación curada manualmente).
+    Ejemplo: consulta='lipase', organismo='Candida antarctica'.
+    """
+    return await cliente().buscar_uniprot(consulta, organismo, solo_revisadas, max_resultados)
+
+
+@herramienta
+async def buscar_kegg(
+    termino: str,
+    base: Literal["enzyme", "pathway", "compound", "reaction", "module", "orthology"] = "enzyme",
+    max_resultados: int = 20,
+) -> list[dict[str, str]]:
+    """Busca enzimas, rutas metabólicas, compuestos, reacciones o módulos en KEGG.
+
+    Use detalle_kegg con el identificador devuelto (p. ej. 'ec:3.1.1.3' o 'map00010').
+    """
+    return await cliente().buscar_kegg(base, termino, max_resultados)
+
+
+@herramienta
+async def detalle_kegg(identificador: str) -> dict[str, Any]:
+    """Obtiene la ficha de una entrada KEGG: nombre, reacción, sustratos, productos y rutas."""
+    return await cliente().detalle_kegg(identificador)
+
+
+@herramienta
+async def listar_proyectos() -> list[str]:
+    """Lista los proyectos configurados (OA_PROYECTOS) y los que ya tienen carpeta."""
+    return cliente().listar_proyectos()
+
+
+@herramienta
+async def agregar_a_bibliografia(
+    dois: list[str], proyecto: str, idioma: Literal["es-ES", "en-US"] = "es-ES"
+) -> dict[str, Any]:
+    """Añade referencias APA 7 a la bibliografía de un proyecto.
+
+    Evita duplicados por DOI y regenera 'referencias_apa.md' en orden alfabético,
+    listo para copiar en el documento del proyecto.
+    """
+    return await cliente().agregar_a_bibliografia(dois, proyecto, idioma)
+
+
+@herramienta
+async def ver_biblioteca(proyecto: str) -> dict[str, Any]:
+    """Muestra los PDF descargados y las referencias guardadas de un proyecto."""
+    return cliente().ver_biblioteca(proyecto)
 
 
 if __name__ == "__main__":
